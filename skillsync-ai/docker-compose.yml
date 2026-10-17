@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: skillsync_db
+      POSTGRES_USER: skillsync
+      POSTGRES_PASSWORD: skillsync123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skillsync -d skillsync_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    command: >
+      sh -c "python backend/seed_data.py &&
+             uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      DATABASE_URL: postgresql://skillsync:skillsync123@db:5432/skillsync_db
+      MANAGER_API_KEY: manager-secret-key-2026
+      EMPLOYEE_API_KEY: employee-secret-key-2026
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: .
+    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      API_BASE: http://api:8000
+      MANAGER_API_KEY: manager-secret-key-2026
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
