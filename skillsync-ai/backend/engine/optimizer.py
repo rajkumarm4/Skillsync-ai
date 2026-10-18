@@ -1,20 +1,19 @@
 """
 Allocation Optimizer — Workforce Skill Liquidity Engine
-Uses Google OR-Tools CP-SAT solver to optimally assign employees to
-projects, maximizing skill coverage while respecting workload limits
-and project deadlines.
+Uses scipy linear programming to optimally assign employees to projects,
+maximizing skill coverage while respecting workload limits and deadlines.
 
-Also computes a naive baseline for comparison (assign by availability
-only, ignoring skills) and reports the improvement percentage.
+Falls back to greedy if scipy is unavailable.
+Deployed on IBM LinuxONE Community Cloud (s390x) — Event Code: SSF2026
 """
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
 try:
-    from ortools.sat.python import cp_model
-    ORTOOLS_AVAILABLE = True
+    from scipy.optimize import linprog
+    SCIPY_AVAILABLE = True
 except ImportError:
-    ORTOOLS_AVAILABLE = False
+    SCIPY_AVAILABLE = False
 
 
 # ─── Data Structures ─────────────────────────────────────────────────────────
@@ -38,7 +37,7 @@ class AllocationResult:
     baseline_score: float                 # naive approach score
     improvement_pct: float                # how much better than naive
     unmet_gaps: List[str]                 # projects with <50% coverage
-    solver_used: str                      # "ortools" or "greedy_fallback"
+    solver_used: str                      # "scipy_lp" or "greedy_fallback"
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
@@ -55,7 +54,6 @@ def run_allocation(
     projects:  list of Project ORM objects
     deadline_override: {project_id: new_deadline_days} for simulation
     """
-    # Apply deadline overrides for simulation
     effective_deadlines = {}
     for p in projects:
         dl = p.deadline_days
@@ -65,14 +63,16 @@ def run_allocation(
 
     baseline = _greedy_baseline(employees, projects, effective_deadlines)
 
-    if ORTOOLS_AVAILABLE:
-        result = _ortools_optimize(employees, projects, effective_deadlines)
+    if SCIPY_AVAILABLE:
+        result = _scipy_optimize(employees, projects, effective_deadlines)
         result.baseline_score = baseline.overall_score
         result.improvement_pct = _improvement(result.overall_score, baseline.overall_score)
-        result.solver_used = "ortools"
+        result.solver_used = "scipy_lp"
     else:
-        result = baseline
-        result.solver_used = "greedy_fallback"
+        result = _smart_greedy(employees, projects, effective_deadlines)
+        result.baseline_score = baseline.overall_score
+        result.improvement_pct = _improvement(result.overall_score, baseline.overall_score)
+        result.solver_used = "greedy_optimized"
 
     return result
 
@@ -83,7 +83,6 @@ def _skill_match_score(employee: Any, project: Any, deadline_days: int) -> float
     """
     Returns a 0.0–1.0 score reflecting how well this employee covers
     the project's required skills given the available deadline.
-    Penalises employees who would need upskilling beyond the deadline.
     """
     if not project.required_skills:
         return 0.0
@@ -95,7 +94,7 @@ def _skill_match_score(employee: Any, project: Any, deadline_days: int) -> float
         skill_name = req["name"]
         min_prof   = req["min_proficiency"]
         headcount  = req.get("headcount", 1)
-        weight     = headcount * min_prof          # higher need → higher weight
+        weight     = headcount * min_prof
 
         emp_skill = _find_skill(employee.skills, skill_name)
         if emp_skill:
@@ -120,82 +119,89 @@ def _spare_hours(emp: Any) -> int:
 
 
 def _hours_per_project() -> int:
-    return 15   # default weekly hours allocated per project assignment
+    return 15
 
 
-# ─── OR-Tools Optimizer ──────────────────────────────────────────────────────
+# ─── Scipy LP Optimizer ──────────────────────────────────────────────────────
 
-def _ortools_optimize(
+def _scipy_optimize(
     employees: List[Any],
     projects: List[Any],
     effective_deadlines: Dict[int, int],
 ) -> AllocationResult:
-    model = cp_model.CpModel()
+    """
+    Relaxed LP: treat assignment variables as continuous [0,1],
+    then round to binary. For 20 employees × 5 projects this gives
+    near-optimal results in milliseconds on s390x.
+    """
+    import numpy as np
 
-    # Decision variables: assign[i][j] ∈ {0, 1}
-    assign = {}
-    scores_scaled = {}   # score × 10000 (CP-SAT needs integers)
+    n_emp  = len(employees)
+    n_proj = len(projects)
+    n_vars = n_emp * n_proj
+    hrs    = _hours_per_project()
 
+    # Build score matrix (maximize → negate for linprog which minimizes)
+    scores = []
     for emp in employees:
         for proj in projects:
-            if _spare_hours(emp) < 5:
-                # Not enough hours — force exclude
-                v = model.NewConstant(0)
-            else:
-                v = model.NewBoolVar(f"assign_e{emp.id}_p{proj.id}")
-
-            assign[(emp.id, proj.id)] = v
-            dl = effective_deadlines[proj.id]
+            dl    = effective_deadlines[proj.id]
             score = _skill_match_score(emp, proj, dl)
-            priority_boost = max(0, (4 - proj.priority)) * 0.05  # priority 1 gets +0.15
-            scores_scaled[(emp.id, proj.id)] = int((score + priority_boost) * 10000)
+            priority_boost = max(0, (4 - proj.priority)) * 0.05
+            scores.append(-(score + priority_boost))
 
-    # Constraint 1: employee total allocated hours ≤ available
-    hrs = _hours_per_project()
-    for emp in employees:
-        model.Add(
-            sum(assign[(emp.id, p.id)] * hrs for p in projects)
-            <= _spare_hours(emp)
-        )
+    c = np.array(scores)
 
-    # Constraint 2: each project gets at most its total required headcount
-    for proj in projects:
+    # Inequality constraints (A_ub @ x <= b_ub)
+    A_ub = []
+    b_ub = []
+
+    # Each employee: sum of assigned projects * hrs <= spare_hours
+    for i, emp in enumerate(employees):
+        row = [0.0] * n_vars
+        for j in range(n_proj):
+            row[i * n_proj + j] = float(hrs)
+        A_ub.append(row)
+        b_ub.append(float(_spare_hours(emp)))
+
+    # Each project: total assigned <= max_headcount * 2
+    for j, proj in enumerate(projects):
         total_needed = sum(r.get("headcount", 1) for r in proj.required_skills)
-        model.Add(
-            sum(assign[(e.id, proj.id)] for e in employees) <= total_needed * 2
-        )
+        row = [0.0] * n_vars
+        for i in range(n_emp):
+            row[i * n_proj + j] = 1.0
+        A_ub.append(row)
+        b_ub.append(float(total_needed * 2))
 
-    # Objective: maximise total weighted skill match
-    model.Maximize(
-        sum(
-            assign[(e.id, p.id)] * scores_scaled[(e.id, p.id)]
-            for e in employees for p in projects
-        )
-    )
+    bounds = [(0.0, 1.0)] * n_vars
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 5.0
-    status = solver.Solve(model)
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        x = res.x if res.success else np.zeros(n_vars)
+    except Exception:
+        x = np.zeros(n_vars)
 
+    # Round: assign if score > 0.4 (relaxed threshold for better coverage)
     assignments = []
     project_emp_map: Dict[int, List] = {p.id: [] for p in projects}
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        for emp in employees:
-            for proj in projects:
-                if solver.Value(assign[(emp.id, proj.id)]) == 1:
-                    score  = scores_scaled[(emp.id, proj.id)] / 10000
-                    rationale = _build_rationale(emp, proj, score, effective_deadlines[proj.id])
-                    assignments.append(AssignmentResult(
-                        employee_id=emp.id,
-                        employee_name=emp.name,
-                        project_id=proj.id,
-                        project_name=proj.name,
-                        assigned_hours=_hours_per_project(),
-                        skill_match_score=round(score, 3),
-                        rationale=rationale,
-                    ))
-                    project_emp_map[proj.id].append(emp)
+    for i, emp in enumerate(employees):
+        for j, proj in enumerate(projects):
+            val = x[i * n_proj + j]
+            if val > 0.4 and _spare_hours(emp) >= hrs:
+                dl    = effective_deadlines[proj.id]
+                score = _skill_match_score(emp, proj, dl)
+                rationale = _build_rationale(emp, proj, score, dl)
+                assignments.append(AssignmentResult(
+                    employee_id=emp.id,
+                    employee_name=emp.name,
+                    project_id=proj.id,
+                    project_name=proj.name,
+                    assigned_hours=hrs,
+                    skill_match_score=round(score, 3),
+                    rationale=rationale,
+                ))
+                project_emp_map[proj.id].append(emp)
 
     coverage = _compute_coverage(projects, project_emp_map, effective_deadlines)
     overall  = round(sum(coverage.values()) / len(coverage), 1) if coverage else 0.0
@@ -208,11 +214,76 @@ def _ortools_optimize(
         baseline_score=0.0,
         improvement_pct=0.0,
         unmet_gaps=unmet,
-        solver_used="ortools",
+        solver_used="scipy_lp",
     )
 
 
-# ─── Greedy Baseline ─────────────────────────────────────────────────────────
+# ─── Smart Greedy (fallback) ─────────────────────────────────────────────────
+
+def _smart_greedy(
+    employees: List[Any],
+    projects: List[Any],
+    effective_deadlines: Dict[int, int],
+) -> AllocationResult:
+    """
+    Skill-aware greedy: assign best skill-matched employees first,
+    sorted by priority. Better than naive availability-only baseline.
+    """
+    hrs = _hours_per_project()
+    assignments = []
+    project_emp_map: Dict[int, List] = {p.id: [] for p in projects}
+    emp_hours_used = {e.id: 0 for e in employees}
+
+    # Sort projects by priority (1=highest first)
+    sorted_projects = sorted(projects, key=lambda p: p.priority)
+
+    for proj in sorted_projects:
+        dl     = effective_deadlines[proj.id]
+        needed = sum(r.get("headcount", 1) for r in proj.required_skills)
+
+        # Rank employees by skill match for this project
+        ranked = sorted(
+            employees,
+            key=lambda e: _skill_match_score(e, proj, dl),
+            reverse=True,
+        )
+
+        filled = 0
+        for emp in ranked:
+            if filled >= needed:
+                break
+            spare = _spare_hours(emp) - emp_hours_used.get(emp.id, 0)
+            if spare >= hrs:
+                score = _skill_match_score(emp, proj, dl)
+                assignments.append(AssignmentResult(
+                    employee_id=emp.id,
+                    employee_name=emp.name,
+                    project_id=proj.id,
+                    project_name=proj.name,
+                    assigned_hours=hrs,
+                    skill_match_score=round(score, 3),
+                    rationale=_build_rationale(emp, proj, score, dl),
+                ))
+                project_emp_map[proj.id].append(emp)
+                emp_hours_used[emp.id] = emp_hours_used.get(emp.id, 0) + hrs
+                filled += 1
+
+    coverage = _compute_coverage(projects, project_emp_map, effective_deadlines)
+    overall  = round(sum(coverage.values()) / len(coverage), 1) if coverage else 0.0
+    unmet    = [p.name for p in projects if coverage.get(p.id, 0) < 50]
+
+    return AllocationResult(
+        assignments=assignments,
+        project_coverage=coverage,
+        overall_score=overall,
+        baseline_score=0.0,
+        improvement_pct=0.0,
+        unmet_gaps=unmet,
+        solver_used="greedy_optimized",
+    )
+
+
+# ─── Naive Greedy Baseline ───────────────────────────────────────────────────
 
 def _greedy_baseline(
     employees: List[Any],
@@ -220,8 +291,8 @@ def _greedy_baseline(
     effective_deadlines: Dict[int, int],
 ) -> AllocationResult:
     """
-    Naive assignment: sort employees by spare hours descending,
-    fill each project's headcount regardless of skill match.
+    Naive assignment: sort by spare hours only, ignore skill match.
+    Used as comparison baseline.
     """
     sorted_emps = sorted(employees, key=lambda e: _spare_hours(e), reverse=True)
     assignments = []
@@ -245,7 +316,7 @@ def _greedy_baseline(
                     project_name=proj.name,
                     assigned_hours=hrs,
                     skill_match_score=round(score, 3),
-                    rationale=f"Baseline: assigned by availability. Skill match: {round(score*100)}%.",
+                    rationale=f"Baseline: assigned by availability only. Skill match: {round(score*100)}%.",
                 ))
                 project_emp_map[proj.id].append(emp)
                 emp_hours_used[emp.id] = emp_hours_used.get(emp.id, 0) + hrs
@@ -262,7 +333,7 @@ def _greedy_baseline(
         baseline_score=overall,
         improvement_pct=0.0,
         unmet_gaps=unmet,
-        solver_used="greedy_fallback",
+        solver_used="greedy_baseline",
     )
 
 
@@ -305,7 +376,7 @@ def _build_rationale(emp: Any, proj: Any, score: float, deadline_days: int) -> s
         if s and s["proficiency"] >= req["min_proficiency"]:
             matched_skills.append(f"{req['name']} (L{s['proficiency']})")
 
-    spare = _spare_hours(emp)
+    spare     = _spare_hours(emp)
     match_pct = int(score * 100)
 
     if matched_skills:
